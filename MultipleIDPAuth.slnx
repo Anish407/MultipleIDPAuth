@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="MultipleAuthAPi.API1/MultipleAuthAPi.API1.csproj" />
+  <Project Path="MultipleIDPAuth.Client/MultipleIDPAuth.Client.csproj" Id="c6d48674-67fc-4a90-897d-df7acf9d41b5" />
+</Solution>
