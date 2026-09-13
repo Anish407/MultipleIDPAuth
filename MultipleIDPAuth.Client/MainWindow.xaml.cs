@@ -4,6 +4,7 @@ using MultipleIDPAuth.Client.Properties;
 using System;
 using System.Configuration;
 using System.Windows;
+using System.Xml.Linq;
 
 namespace MultipleIDPAuth.Client
 {
@@ -15,10 +16,12 @@ namespace MultipleIDPAuth.Client
         private string _accessToken;
         private string _refreshToken;
         private DateTimeOffset _accessTokenExpiresAt;
+        private DpapiTokenStore _tokenStore { get; set; }
 
         public MainWindow()
         {
             InitializeComponent();
+            _tokenStore = new DpapiTokenStore();
 
             _oidcClient = CreateOidcClient();
         }
@@ -59,6 +62,11 @@ namespace MultipleIDPAuth.Client
             return new OidcClient(options);
         }
 
+        private async void RefreshButton_Click(object sender, RoutedEventArgs e)
+        {
+
+        }
+
         private async void LoginButton_Click(object sender, RoutedEventArgs e)
         {
             try
@@ -93,12 +101,24 @@ namespace MultipleIDPAuth.Client
                 _accessToken = result.AccessToken;
                 _refreshToken = result.RefreshToken;
                 _accessTokenExpiresAt = result.AccessTokenExpiration;
+                string subject = result.User?.FindFirst("sub")?.Value ?? "Unknown subject";
 
                 var displayName =
                     result.User?.FindFirst("name")?.Value ??
                     result.User?.FindFirst("preferred_username")?.Value ??
-                    result.User?.FindFirst("sub")?.Value ??
-                    "Unknown user";
+                    subject;
+
+                if (!string.IsNullOrWhiteSpace(_refreshToken))
+                {
+                    var storedSession = new StoredTokenSession
+                    {
+                        RefreshToken = _refreshToken,
+                        Subject = subject,
+                        DisplayName = displayName
+                    };
+
+                    _tokenStore.Save(storedSession);
+                }
 
                 StatusText.Text =
                     "Login successful" +
