@@ -4,33 +4,17 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace MultipleIDPAuth.Client
 {
-    /// <summary>
-    /// Data that is persisted between application runs.
-    ///
-    /// The access token is intentionally not stored here.
-    /// It will only live in memory while an application instance is running.
-    /// </summary>
     internal sealed class StoredTokenSession
     {
-        // Version of the persisted file structure.
-        //
-        // If we change the structure later, we can increase this value
-        // and decide how older stored sessions should be handled.
         public int Version { get; set; } = 1;
 
-        // Identifies the shared authentication session.
-        //
-        // We are only storing this value for now.
-        // Later we will use it to detect when another application instance
-        // has replaced or ended the shared session.
-        public string Generation { get; set; }
-            = Guid.NewGuid().ToString("N");
+        public string Generation { get; set; } =
+            Guid.NewGuid().ToString("N");
 
-        // Persisted so the application can obtain a new access token
-        // after restart without requiring interactive login again.
         public string RefreshToken { get; set; }
 
         public string Subject { get; set; }
@@ -38,31 +22,25 @@ namespace MultipleIDPAuth.Client
         public string DisplayName { get; set; }
     }
 
-    /// <summary>
-    /// Persists the authentication session using Windows DPAPI.
-    ///
-    /// The session is stored separately for each environment and
-    /// OIDC configuration.
-    /// </summary>
     internal sealed class DpapiTokenStore
     {
         private const int CurrentVersion = 1;
 
-        // A normal token session should only be a few KB.
-        // This prevents us from attempting to process a clearly invalid
-        // or unexpectedly large file.
-        private const int MaxSessionFileSizeBytes =
+        private const long MaxSessionFileSize =
             1024 * 1024;
 
         private readonly string _directory;
+
         private readonly string _filePath;
+
+        private readonly string _mutexName;
 
         public DpapiTokenStore(
             string environmentName,
             string authority,
             string clientId,
-            string scope,
-            string resource = null)
+            string scopes,
+            string resource)
         {
             if (string.IsNullOrWhiteSpace(environmentName))
             {
@@ -85,119 +63,216 @@ namespace MultipleIDPAuth.Client
                     nameof(clientId));
             }
 
-            if (string.IsNullOrWhiteSpace(scope))
+            if (string.IsNullOrWhiteSpace(scopes))
             {
                 throw new ArgumentException(
-                    "Scope is required.",
-                    nameof(scope));
+                    "Scopes are required.",
+                    nameof(scopes));
             }
 
-            /*
-             * Scope order should not create a different storage folder.
-             *
-             * These should be treated as equivalent:
-             *
-             *   openid profile offline_access
-             *   offline_access openid profile
-             *
-             * Sorting them gives us one consistent representation.
-             */
             var normalizedScopes =
-                string.Join(
-                    " ",
-                    scope
-                        .Split(
-                            new[] { ' ' },
-                            StringSplitOptions.RemoveEmptyEntries)
-                        .Distinct(StringComparer.Ordinal)
-                        .OrderBy(
-                            value => value,
-                            StringComparer.Ordinal));
+                NormalizeScopes(scopes);
+
+            var normalizedResource =
+                string.IsNullOrWhiteSpace(resource)
+                    ? string.Empty
+                    : resource.Trim();
 
             /*
-             * This string uniquely identifies the OIDC configuration
-             * within the selected environment.
-             */
-            var configurationIdentity =
-                authority.TrimEnd('/') +
-                "\n" +
-                clientId.Trim() +
-                "\n" +
-                normalizedScopes +
-                "\n" +
-                (resource ?? string.Empty).Trim();
-
-            string configurationKey;
-
-            /*
-             * Hash the configuration instead of using authority/clientId
-             * directly as folder names.
+             * This identifies one logical authentication store.
              *
-             * This gives us a short, filesystem-safe identifier.
+             * Same environment + same IdP configuration
+             * => same storeKey
+             *
+             * Different environment/configuration
+             * => different storeKey
              */
-            using (var sha256 = SHA256.Create())
-            {
-                var identityBytes =
-                    Encoding.UTF8.GetBytes(
-                        configurationIdentity);
+            var storeIdentity =
+                environmentName.Trim() + "\n" +
+                authority.Trim().TrimEnd('/') + "\n" +
+                clientId.Trim() + "\n" +
+                normalizedScopes + "\n" +
+                normalizedResource;
 
-                try
+            string storeKey;
+
+            var identityBytes =
+                Encoding.UTF8.GetBytes(storeIdentity);
+
+            try
+            {
+                using (var sha256 = SHA256.Create())
                 {
-                    configurationKey =
+                    var hash =
+                        sha256.ComputeHash(identityBytes);
+
+                    storeKey =
                         BitConverter
-                            .ToString(
-                                sha256.ComputeHash(
-                                    identityBytes))
-                            .Replace("-", string.Empty);
-                }
-                finally
-                {
-                    Array.Clear(
-                        identityBytes,
-                        0,
-                        identityBytes.Length);
+                            .ToString(hash)
+                            .Replace("-", "");
                 }
             }
+            finally
+            {
+                Array.Clear(
+                    identityBytes,
+                    0,
+                    identityBytes.Length);
+            }
 
-            /*
-             * Example:
-             *
-             * %LOCALAPPDATA%
-             *   MultipleIDPAuth
-             *     dev
-             *       Auth
-             *         <configuration hash>
-             *           session.dat
-             */
             _directory =
                 Path.Combine(
                     Environment.GetFolderPath(
-                        Environment.SpecialFolder.LocalApplicationData),
+                        Environment.SpecialFolder
+                            .LocalApplicationData),
                     "MultipleIDPAuth",
-                    environmentName.Trim(),
                     "Auth",
-                    configurationKey);
+                    storeKey);
 
             _filePath =
                 Path.Combine(
                     _directory,
                     "session.dat");
+
+            /*
+             * This is a Windows named mutex.
+             *
+             * It is NOT attached to session.dat.
+             *
+             * Every process using the same name
+             * participates in the same cross-process lock.
+             */
+            _mutexName =
+                @"Local\MultipleIDPAuth-" +
+                storeKey;
         }
 
         /// <summary>
-        /// Encrypts and persists the current session.
-        ///StoredTokenSession
-                ///    ↓
-                ///JSON
-                ///    ↓
-                ///UTF-8 bytes
-                ///    ↓
-                ///DPAPI encrypt
-                ///    ↓
-                ///session.dat
-        /// The new session is written to a temporary file first and only
-        /// replaces session.dat after the write succeeds.
+        /// Executes an entire logical session transaction
+        /// exclusively across WPF processes using the same
+        /// token store.
+        ///
+        /// Everything inside operation() runs while this
+        /// process owns the named mutex.
         /// </summary>
+        public T ExecuteExclusive<T>(
+            Func<T> operation)
+        {
+            if (operation == null)
+            {
+                throw new ArgumentNullException(
+                    nameof(operation));
+            }
+
+            using (var mutex =
+                   new Mutex(
+                       initiallyOwned: false,
+                       name: _mutexName))
+            {
+                var acquired = false;
+
+                try
+                {
+                    /*
+                     * This inner try/catch deals specifically
+                     * with acquiring the mutex.
+                     */
+                    try
+                    {
+                        /*
+                         * If another process currently owns
+                         * this named mutex, this thread waits
+                         * here.
+                         *
+                         * It does NOT continue to Load(),
+                         * check expiry, refresh, etc.
+                         */
+                        mutex.WaitOne();
+
+                        acquired = true;
+                    }
+                    catch (AbandonedMutexException)
+                    {
+                        /*
+                         * Another thread/process died while
+                         * owning this mutex.
+                         *
+                         * Important:
+                         *
+                         * When AbandonedMutexException is
+                         * thrown from WaitOne(), this thread
+                         * has actually acquired ownership of
+                         * the mutex.
+                         *
+                         * Therefore acquired = true.
+                         *
+                         * The previous logical operation may
+                         * not have completed, so persisted
+                         * state could potentially represent
+                         * an interrupted operation.
+                         */
+                        acquired = true;
+                    }
+
+                    /*
+                     * operation() is still inside the OUTER
+                     * try block.
+                     *
+                     * At this point we own the mutex.
+                     *
+                     * Everything executed by operation()
+                     * remains protected until the finally
+                     * block releases the mutex.
+                     */
+                    var result =
+                        operation();
+
+                    return result;
+                }
+                finally
+                {
+                    /*
+                     * Runs whether:
+                     *
+                     * - operation succeeds
+                     * - operation throws
+                     * - Load throws
+                     * - Save throws
+                     * - refresh throws
+                     *
+                     * If we obtained ownership, always
+                     * release it.
+                     */
+                    if (acquired)
+                    {
+                        mutex.ReleaseMutex();
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Convenience overload for operations that return
+        /// no value.
+        /// </summary>
+        public void ExecuteExclusive(
+            Action operation)
+        {
+            if (operation == null)
+            {
+                throw new ArgumentNullException(
+                    nameof(operation));
+            }
+
+            ExecuteExclusive(
+                () =>
+                {
+                    operation();
+
+                    return true;
+                });
+        }
+
         public void Save(
             StoredTokenSession session)
         {
@@ -210,32 +285,28 @@ namespace MultipleIDPAuth.Client
             if (session.Version != CurrentVersion)
             {
                 throw new InvalidOperationException(
-                    "Unsupported token-store version.");
+                    "Unsupported token session version.");
             }
 
             if (string.IsNullOrWhiteSpace(
-                session.Generation))
+                    session.Generation))
             {
                 throw new InvalidOperationException(
-                    "Session generation is required.");
+                    "Token session generation is required.");
             }
 
             Directory.CreateDirectory(
                 _directory);
 
-            /*
-             * Never overwrite session.dat directly.
-             *
-             * If writing fails halfway through, the previous valid
-             * session.dat remains untouched.
-             */
-            var temporaryPath =
+            var temporaryFilePath =
                 Path.Combine(
                     _directory,
-                    Guid.NewGuid().ToString("N") +
+                    Guid.NewGuid()
+                        .ToString("N") +
                     ".tmp");
 
             byte[] plainBytes = null;
+
             byte[] encryptedBytes = null;
 
             try
@@ -245,54 +316,62 @@ namespace MultipleIDPAuth.Client
                         session);
 
                 plainBytes =
-                    Encoding.UTF8.GetBytes(
-                        json);
+                    Encoding.UTF8
+                        .GetBytes(json);
 
-                /*
-                 * CurrentUser means Windows DPAPI protects the data
-                 * for the currently logged-in Windows user.
-                 */
                 encryptedBytes =
                     ProtectedData.Protect(
                         plainBytes,
-                        null,
-                        DataProtectionScope.CurrentUser);
+                        optionalEntropy: null,
+                        scope:
+                            DataProtectionScope
+                                .CurrentUser);
 
                 /*
-                 * Write the complete new encrypted file first.
+                 * Write the complete encrypted payload to
+                 * a separate temporary file first.
                  */
                 using (var stream =
-                    new FileStream(
-                        temporaryPath,
-                        FileMode.CreateNew,
-                        FileAccess.Write,
-                        FileShare.None,
-                        4096,
-                        FileOptions.WriteThrough))
+                       new FileStream(
+                           temporaryFilePath,
+                           FileMode.CreateNew,
+                           FileAccess.Write,
+                           FileShare.None,
+                           bufferSize: 4096,
+                           options:
+                               FileOptions.WriteThrough))
                 {
                     stream.Write(
                         encryptedBytes,
                         0,
                         encryptedBytes.Length);
 
-                    // Flush buffered data before replacing session.dat.
+                    /*
+                     * Flush the data through the underlying
+                     * file handle before replacing the
+                     * existing session.dat.
+                     */
                     stream.Flush(true);
                 }
 
                 /*
-                 * Only now replace the official session file.
+                 * Never rewrite session.dat in place.
+                 *
+                 * Replace the old complete file with the
+                 * new complete file.
                  */
                 if (File.Exists(_filePath))
                 {
                     File.Replace(
-                        temporaryPath,
+                        temporaryFilePath,
                         _filePath,
-                        null);
+                        destinationBackupFileName:
+                            null);
                 }
                 else
                 {
                     File.Move(
-                        temporaryPath,
+                        temporaryFilePath,
                         _filePath);
                 }
             }
@@ -315,37 +394,29 @@ namespace MultipleIDPAuth.Client
                 }
 
                 /*
-                 * If anything failed before File.Replace/File.Move,
-                 * remove the unfinished temporary file.
+                 * If anything failed before the Move or
+                 * Replace completed, clean up the
+                 * temporary file.
                  */
                 if (File.Exists(
-                    temporaryPath))
+                        temporaryFilePath))
                 {
-                    File.Delete(
-                        temporaryPath);
+                    try
+                    {
+                        File.Delete(
+                            temporaryFilePath);
+                    }
+                    catch
+                    {
+                        /*
+                         * Do not replace the original Save
+                         * exception with a cleanup error.
+                         */
+                    }
                 }
             }
         }
 
-        /// <summary>
-        /// Loads and decrypts the persisted authentication session.
-        /// Load()
-        ///  session.dat
-        ///      ↓
-        ///  encrypted bytes
-        ///      ↓
-        ///  DPAPI decrypt
-        ///      ↓
-        ///  UTF-8 JSON
-        ///      ↓
-        ///  StoredTokenSession
-        /// Returns null when there is no usable stored session.
-        /// </summary>
-        /// <summary>
-        /// Loads and decrypts the persisted authentication session.
-        ///
-        /// Returns null if no usable stored session exists.
-        /// </summary>
         public StoredTokenSession Load()
         {
             if (!File.Exists(_filePath))
@@ -353,73 +424,65 @@ namespace MultipleIDPAuth.Client
                 return null;
             }
 
-            var fileInfo =
-                new FileInfo(_filePath);
-
-            /*
-             * A normal session file should be very small.
-             *
-             * If the file is empty or unexpectedly huge, treat it as invalid
-             * instead of trying to decrypt/process it.
-             */
-            if (fileInfo.Length <= 0 ||
-                fileInfo.Length > MaxSessionFileSizeBytes)
-            {
-                return null;
-            }
-
             byte[] encryptedBytes = null;
+
             byte[] plainBytes = null;
 
             try
             {
+                var fileInfo =
+                    new FileInfo(
+                        _filePath);
+
                 /*
-                 * Read the encrypted DPAPI payload from disk.
+                 * The token session should be tiny.
+                 *
+                 * This protects us against unexpectedly
+                 * large/corrupt files.
                  */
+                if (fileInfo.Length <= 0 ||
+                    fileInfo.Length >
+                    MaxSessionFileSize)
+                {
+                    return null;
+                }
+
                 encryptedBytes =
                     File.ReadAllBytes(
                         _filePath);
 
-                /*
-                 * Decrypt using the current Windows user's DPAPI context.
-                 *
-                 * This must match the DataProtectionScope.CurrentUser used
-                 * when Save() encrypted the session.
-                 */
                 plainBytes =
                     ProtectedData.Unprotect(
                         encryptedBytes,
-                        null,
-                        DataProtectionScope.CurrentUser);
+                        optionalEntropy: null,
+                        scope:
+                            DataProtectionScope
+                                .CurrentUser);
 
-                /*
-                 * Convert decrypted bytes back into the JSON that Save()
-                 * originally serialized.
-                 */
                 var json =
-                    Encoding.UTF8.GetString(
-                        plainBytes);
+                    Encoding.UTF8
+                        .GetString(
+                            plainBytes);
 
                 var session =
                     JsonSerializer
-                        .Deserialize<StoredTokenSession>(
+                        .Deserialize
+                        <StoredTokenSession>(
                             json);
 
-                /*
-                 * Validate the stored structure before returning it.
-                 */
                 if (session == null)
                 {
                     return null;
                 }
 
-                if (session.Version != CurrentVersion)
+                if (session.Version !=
+                    CurrentVersion)
                 {
                     return null;
                 }
 
                 if (string.IsNullOrWhiteSpace(
-                    session.Generation))
+                        session.Generation))
                 {
                     return null;
                 }
@@ -431,26 +494,23 @@ namespace MultipleIDPAuth.Client
                 /*
                  * Examples:
                  *
-                 * - file is corrupted
-                 * - file was encrypted by another Windows user
-                 * - DPAPI cannot decrypt it
+                 * - data cannot be decrypted by this
+                 *   Windows user
+                 *
+                 * - encrypted data is corrupt
                  */
                 return null;
             }
             catch (JsonException)
             {
-                /*
-                 * DPAPI decryption worked, but the decrypted data is not
-                 * a valid StoredTokenSession JSON document.
-                 */
+                return null;
+            }
+            catch (IOException)
+            {
                 return null;
             }
             finally
             {
-                /*
-                 * Remove byte-array copies of credential data as soon as
-                 * we are finished with them.
-                 */
                 if (plainBytes != null)
                 {
                     Array.Clear(
@@ -469,12 +529,6 @@ namespace MultipleIDPAuth.Client
             }
         }
 
-        /// <summary>
-        /// Removes the persisted session completely.
-        ///
-        /// For now this is intentionally simple.
-        /// We will revisit multi-instance logout behavior later.
-        /// </summary>
         public void Clear()
         {
             if (File.Exists(_filePath))
@@ -482,6 +536,29 @@ namespace MultipleIDPAuth.Client
                 File.Delete(
                     _filePath);
             }
+        }
+
+        private static string NormalizeScopes(
+            string scopes)
+        {
+            return string.Join(
+                " ",
+                scopes
+                    .Split(
+                        new[] { ' ' },
+                        StringSplitOptions
+                            .RemoveEmptyEntries)
+                    .Select(
+                        scope =>
+                            scope.Trim())
+                    .Where(
+                        scope =>
+                            scope.Length > 0)
+                    .Distinct(
+                        StringComparer.Ordinal)
+                    .OrderBy(
+                        scope => scope,
+                        StringComparer.Ordinal));
         }
     }
 }
